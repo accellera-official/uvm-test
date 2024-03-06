@@ -1,0 +1,11 @@
+*.log
+*.fails
+transcript
+*.swp
+irun.history
+indago.history
+cov_work
+ida.db
+.dvt
+
+
