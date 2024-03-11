@@ -1,0 +1,1114 @@
+eval 'exec perl -S $0 ${1+"$@"}'
+if 0;
+package run_tests;
+
+##----------------------------------------------------------------------
+## Copyright 2010-2018 Cadence Design Systems, Inc.
+## Copyright 2010-2011 Mentor Graphics Corporation
+## Copyright 2010 AMD
+## Copyright 2017 NVIDIA Corporation
+## Copyright 2010-2013 Synopsys, Inc.
+##   All Rights Reserved Worldwide
+##
+##   Licensed under the Apache License, Version 2.0 (the
+##   "License"); you may not use this file except in
+##   compliance with the License.  You may obtain a copy of
+##   the License at
+##
+##       http://www.apache.org/licenses/LICENSE-2.0
+##
+##   Unless required by applicable law or agreed to in
+##   writing, software distributed under the License is
+##   distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+##   CONDITIONS OF ANY KIND, either express or implied.  See
+##   the License for the specific language governing
+##   permissions and limitations under the License.
+##----------------------------------------------------------------------
+
+use Getopt::Long qw(:config no_ignore_case);
+use Cwd qw(abs_path chdir);
+use File::Spec::Functions qw(catfile path);
+use File::Path qw(mkpath rmtree);
+use File::Basename;
+use File::Copy qw(move);
+use Fcntl qw(:flock :mode);
+use File::Temp qw(tempdir);
+use Digest::MD5 qw(md5_hex);
+my $script = abs_path(__FILE__);
+my $script_name = basename($script);
+my @myargv = @ARGV;
+
+
+sub usage {
+
+print STDERR <<USAGE;
+Usage: $script_name [options] tool {dir}
+
+   tool     Name of the tool to run the tests on
+   dir      Name of the directories containing the UVM testcases
+
+Options:
+   -c                    Do not run. Only clean-up tool-generated files.
+   -C opts               Add the specified options to the compilation command
+   -d                    Do not remove tool-generated files
+   -f fname              Execute tests listed in specified file (one per line)
+   -F fname              Write list of failing and skipped tests in specfied file instead of
+                            "tool.fails" (can later be used with -f).  Can not be used
+                            with -Ff or -Fs.
+   -Ff fname             Write list of failing tests in specified file instead of
+                            "tool.fails" (can later be used with -f).  Can not be used
+                            with -F.  Absent a corresponding -Fs, skipped tests will
+                            not be written.
+   -Fs fname             Write list of skipped tests in specified file instead of
+                            "tool.fails" (can later be used with -f).  Can not be used
+                            with -F. Absent a corresponding -Ff, failed tests will
+                            be written to "tool.fails".
+   -h                    Print this message
+   -nokeep_fails         Delete temp directory for failing tests. Only valid when
+                            used with -t option
+   -l                    fname Redirect stdout and stderr to specified file
+   -L <dir>              Directory to create lock files in order to prevent file
+                            contention when jobs are running in parallel.
+                            If -t is specified this option is ignored
+   -M opts               Add the specified options to makefile command line
+                           (applies to makefile-based tests)
+   -q                    Use queue to submit jobs in parallel. All input and
+                            output files located in the .jobs subdirectory.
+                            stdout and stderr are included in the output log
+   -Qx name              Name of the executable for submitting queues (default=bsub)
+   -Q opts               Add the specified options to the command that submits
+                            the jobs to the queue
+   -R opts               Add the specified options to the simulation command
+   -S                    Do not skip tests
+   -t                    Run tests out of a temp directory.
+                            Directory is removed when test is complete unless
+                            -d is specified or test fails and -nokeep_fails is
+                            not specificed.
+   -tests_per_job <num>  Runs <num> tests into a single job instead of 1 test
+                            per job                       
+   -u dir                Use the UVM distribution in the specified directory
+   -v                    Display the output of the testcase on stdout
+
+USAGE
+   exit(1);
+}
+
+#
+# Run and summarize a set of tests
+#
+sub run() {
+  &GetOptions ("0"  ,
+               "c"  ,
+               "C=s",
+               "d"  ,
+               "f=s",
+               "F=s",
+               "Ff=s",
+               "Fs=s",
+               "P"  ,
+               "h"  ,
+               "R=s",
+               "S"  ,
+               "u=s",
+               "M=s",
+               "q"  ,
+               "Qx=s",
+               "Q=s",
+               "t"  ,
+               "l=s",
+               "L=s",
+               "tests_per_job=i" => \$opt_tests_per_job,
+               'nokeep_fails' => \$opt_nokeep_fails,
+               'compat_pkgdir=s' => \$opt_compat_pkgdir,
+               "v"
+               );
+  &usage if $opt_h || $#ARGV < 0;
+  
+  if ($opt_l) {
+    if (!open(STDOUT, "> $opt_l")) {
+      print STDERR "Cannot open \"$opt_l\" for writing: $!\n";
+      exit(1);
+    }
+    *STDERR = *STDOUT;
+  }
+  $tool = shift(@ARGV);
+
+  if (!$opt_u) {
+    # Find "distrib" directory
+    $opt_u = "distrib";
+    for($_ = 0; $_ < 10; $_++) {
+      last if -e $opt_u;
+      $opt_u = "../$opt_u";
+    }
+    if (!-e $opt_u) {
+      print STDERR "ERROR: Cannot locate UVM distribution. Use the -u option to specify its location.\n";
+      exit(1);
+    }
+  }
+  if (! -e "$opt_u/src/uvm_pkg.sv") {
+    print STDERR "ERROR: \"$opt_u\" does not appear to contain a valid UVM distribution.\n";
+    exit(1);
+  }
+  $uvm_home = abs_path($opt_u);
+
+  if ($opt_compat_pkgdir) {
+      $compat_home = abs_path($opt_compat_pkgdir);
+  } else {
+      $compat_home = $uvm_home;
+  }
+
+  $libdir = abs_path(dirname($script) . '/../../tools/' . $tool);
+  if (! -e $libdir) {
+     print STDERR "Tool-specific library \"$libdir\" does not exists.\n";
+     exit(1);
+  }
+  push(@INC, $libdir);
+
+  require "run_test.pl";
+  $dev_tests_base=abs_path(dirname($script) . "/../../tests");
+
+  #
+  # Always keep a list of failed tests
+  #
+  die "-F and -Ff/-Fs are mutually exclusive!" if ($opt_F && ($opt_Ff || $opt_Fs));
+  if ($opt_F) {
+      $opt_Ff = $opt_F;
+      $opt_Fs = $opt_F;
+      undef $opt_F;
+  }
+
+  my $fails_out;
+  my $skips_out;
+  
+  $opt_Ff = "$tool.fails" unless $opt_Ff;
+  
+  if (!open($fails_out, "> $opt_Ff")) {
+      print STDERR "Cannot open \"$opt_Ff\" for writing: $!\n";
+      exit(1);
+  }
+
+  #
+  # If the -Ff is provided, but not -Fs, skips will not be output.
+  #
+  if ($opt_Fs) {
+      if ($opt_Ff eq $opt_Fs) {
+          $skips_out = $fails_out;
+      } else {
+          if (!open($skips_out, "> $opt_Fs")) {
+              print STDERR "Cannot open \"$opt_Fs\" for writing: $!\n";
+              exit(1);
+          }
+      }
+  }
+
+  #
+  # The '-c' option is redundent for the "clean" pseudo-tool
+  #
+  $opt_c = 0 if $tool eq "clean";
+
+  #
+  # Find all of the test directories in the supplied arguments
+  #
+
+  if ($opt_f) {
+
+    if (!open(F, "< $opt_f")) {
+      print STDERR "Cannot open \"$opt_f\" for reading: $!\n";
+      exit(1);
+    }
+    while ($_ = <F>) {
+      chomp($_);
+      push(@dirs, $_);
+    }
+    close(F);
+  } else {
+    if ($#ARGV == -1) {
+      @ARGV = <[0-9][0-9]*>;
+    }
+    foreach $dir (@ARGV) {
+      if (! -d $dir) {
+        print STDERR "test directory \"$dir\" does not exist.\n";
+        exit(1);
+      }
+      $dir =~ s|/$||;
+      push(@dirs, &get_testdirs($dir));
+    }
+  }
+
+
+
+  $| = 1;
+
+  #
+  # Run the individual tests
+  #
+  $failures = 0;
+
+  if ($opt_q) {
+   # use function pointer to allow users to override
+   # the function called to submit jobs to the queue.
+   # set to 'queue_jobs' if not defined.
+    $submit_jobs = \&queue_jobs unless defined $submit_jobs;
+    $job_dir = ".jobs";
+    if (-e $job_dir) {
+      rmtree($job_dir, {keep_root => 1});
+    }
+    else {
+      mkpath $job_dir;
+    }
+    $job_dir = abs_path($job_dir);
+    $job_info_ref = &get_job_info(\@dirs, $job_dir);
+    $submit_jobs->(@{$job_info_ref->{'commands'}});
+    &get_job_result(\@dirs, $job_info_ref->{'logs'}, $skips_out, $fails_out);
+  }
+  else {
+    foreach $dir (@dirs) {
+      # trailing '/'s confuse this script
+      $dir =~ s|/$||;
+      $returnCode = &run_one_test($dir);
+      if ($returnCode != 0) {
+        $failures++;
+        if ($skips_out && ($returnCode == 2)) {
+            print $skips_out "$dir\n";
+        } else {
+            print $fails_out "$dir\n";
+        }
+      }
+    }
+  }
+  print "-----------------------------------------------------------------\n";
+  $txt = sprintf("Total of %d tests ", $#dirs+1);
+  $dots = substr("............................................", 0, 46-length($txt));
+  print $txt, $dots;
+  $failures -= $skipped;
+  if ($failures > 0) {
+    printf " FAILED %d of %d tests (%d skipped)", $failures, $#dirs+1, $skipped;
+  } elsif ($skipped > 0) {
+     printf " PASSED %d of %d tests (%d skipped)", $#dirs+1-$skipped, $#dirs+1, $skipped;
+  } else {
+     print " PASSED all tests";
+  }
+  print "\n";
+
+  if ($skips_out != $fails_out) {
+      close($skips_out);
+      unlink($opt_Fs) unless $skipped;
+  }
+  close($fails_out);
+  unlink($opt_Ff) unless $failures;
+  exit($failures);
+}
+
+#
+# Recursively find all test directories
+#
+sub get_testdirs {
+  local($dir, $_, @subs, @dirs) = @_;
+
+    @dirs = ();
+    if (-e "$dir/test.sv" || -e "$dir/test.pl") {
+      push(@dirs, $dir);
+    }
+    @subs = <$dir/[0-9][0-9]*>;
+    return @dirs if $#subs == -1;
+
+    foreach $_ (@subs) {
+      push(@dirs, &get_testdirs($_));
+    }
+    return @dirs;
+}
+
+#
+# Run one test in the specified directory
+#
+# Return non-zero if the test fails.
+#
+sub run_one_test {
+    $comp_args = "";
+   local($testdir, $_) = @_;
+
+   local($dir) = $testdir;
+   if (length($dir) > 43) {
+     $dir = substr($dir, 0, 43) . "*";
+   }
+   $dots = substr("............................................", 0, 45-length($dir));
+   print "$dir $dots ";
+
+   if (! -d $testdir) {
+     print "**FAIL** ($testdir not exist)";
+     print "\n";
+     return 1;
+   }
+
+   if (-e "$testdir/compat_lib.use") {
+      $compat_lib_home = abs_path($compat_home . '/compat');
+      $compat_args = '+incdir+' . $compat_lib_home . " " . $compat_lib_home . '/uvm_compat_pkg.sv'; 
+   }
+
+   if (!$opt_S && !$opt_c && (-e "$testdir/$tool.skip" || -e "$testdir/all.skip")) {
+     undef @skippers;
+     if (-e "$testdir/all.skip") {
+        push(@skippers, "all simulators");
+     }
+     elsif ( -e "$testdir/$tool.skip") {
+       foreach $skipper (<$testdir/*.skip>) {
+        $skipper =~ s|$testdir/(.*)\.skip|$1|;
+        push(@skippers, $skipper) unless $skipper eq $tool;
+       }
+     }
+     print "SKIP ";
+     print "(", join(", ", @skippers), ")" if @skippers;
+     print "($tool only)" unless @skippers;
+     print " (-S to force)\n";
+     $skipped++;
+     return 2; # return value of 2 to indicate a skip to caller
+   }
+
+   #
+   $ENV{'UVM_HOME'}=$uvm_home;
+   $ENV{'DEV_TESTS_BASE'}=$dev_tests_base;
+
+   local($sv) = ("$testdir/test.sv");
+   local($rundir) = abs_path($testdir);
+   local($failed);
+
+   if (!$opt_c & $opt_t) {
+     $rundir = &setup_tempdir($rundir);
+   }
+
+   if (! -e $sv) {
+     # Maybe it is a script instead of an SV file?
+     local($pl) = ("$rundir/test.pl");
+     if (-e $pl) {
+       $post_test = 0;
+       print "<running>\n" if ($opt_v || $opt_P);
+       local($cwd) = $ENV{'PWD'};
+       chdir $rundir;
+       $failed = do "test.pl";
+       chdir $cwd;
+       print "$testdir $dots " if ($opt_v || $opt_P);
+
+       if (!defined($failed) || $@) {
+         print "**FAIL** (Invalid test.pl)";
+         print "\n";
+         $failed = 1;
+       }
+       elsif ($failed ne "0") {
+         $post_test = "test.pl" unless $post_test;
+         print "**FAIL** ($post_test)";
+         print "\n";
+       } else {
+         $post_test = "from test.pl" unless $post_test;
+         if ($opt_c) {
+           &clean_tempdirs($testdir);
+           print "clean ($post_test)\n";
+         } else {
+           print "pass ($post_test)";
+           print "\n";
+         }
+       }
+
+     }
+     else {
+       print "**FAIL** (Neither $sv nor $pl exist)";
+       print "\n";
+       $failed = 1;
+     }
+   }
+   else {
+
+     if (!$opt_c) {
+       print "<running>\n" if ($opt_v || $opt_P);
+
+       if (-e "$rundir/$tool.comp.args") {
+         if (!open(ARGS, "< $rundir/$tool.comp.args")) {
+           print "**FAIL** (Cannot read $tool.comp.args)";
+           print "\n";
+         }
+         while ($_ = <ARGS>) {
+           chomp;
+           $comp_args .= " $_";
+         }
+         close(ARGS);
+       }
+
+       $defs = "";
+       if (-e "$rundir/test.defines") {
+         if (!open(ARGS, "< $rundir/test.defines")) {
+           print "**FAIL** (Cannot read test.defines)";
+           print "\n";
+         }
+         while ($_ = <ARGS>) {
+           chomp;
+           $defs .= " $_";
+         }
+         close(ARGS);
+       }
+
+       $run_args = "";
+       if (-e "$rundir/$tool.run.args") {
+         if (!open(ARGS, "< $rundir/$tool.run.args")) {
+           print "**FAIL** (Cannot read $tool.run.args)";
+           print "\n";
+         }
+         while ($_ = <ARGS>) {
+           chomp;
+           $run_args .= " $_";
+         }
+         close(ARGS);
+       }
+
+       $plusargs = "";
+       if (-e "$rundir/test.plusargs") {
+          &run_the_test($rundir, "$comp_args $opt_C $defs",
+         "$run_args $opt_R -f $rundir/test.plusargs","$compat_args");
+       } else {
+         &run_the_test($rundir, "$comp_args $opt_C $defs",
+         "$run_args $opt_R","$compat_args");
+       }
+       
+ #        if (!open(ARGS, "< $rundir/test.plusargs")) {
+ #          print "**FAIL** (Cannot read test.plusargs)";
+ #          print "\n";
+ #        }
+ #        close(ARGS);
+ #        
+ #        $plusargs = "";
+ #        while ($_ = <ARGS>) {
+ #          chomp;
+ #          $plusargs .= " $_";
+ #        }
+ #        close(ARGS);
+ #      }
+
+  #     &run_the_test($rundir, "$comp_args $opt_C $defs",
+   #      "$run_args $opt_R -f $plusargs");
+
+       print "$testdir $dots " if ($opt_v || $opt_P);
+
+     }
+
+     #
+     # Clean up all temporary files, except the log file
+     #
+     if (!$opt_d || $opt_c) {
+       &cleanup_test($rundir);
+       if ($opt_c) {
+          &clean_tempdirs($testdir);
+          print "$tool clean.\n";
+          return 0;
+       }
+     }
+
+     #
+     # Check if the test was succesful
+     #
+     $failed = &check_test($rundir);
+
+   }
+   if ($opt_t) {
+     if ($opt_d | (!$opt_nokeep_fails & ($failed != 0))) {
+       &relocate_tempdir($rundir,$testdir);
+     }
+   }
+
+   return $failed;
+
+}
+
+
+#
+# Check if the test passed or failed.
+#
+# Display on STDOUT the status of the test and
+# return non-zero if it failed.
+#
+sub check_test {
+   local($testdir, $_) = @_;
+
+   local($log, @errs);
+   $log = "$testdir/" . &runtime_log_fname();
+
+   # Special "clean" logfile
+   if ($log =~ m|/!$|) {
+     print "clean.\n";
+     return 0;
+   }
+
+   # If there is no run-time logfile, it could be an expected compile-time
+   # failure...
+   if ((! -e $log) ||(&runtime_log_fname() eq &comptime_log_fname())) {
+     $log = "$testdir/" . &comptime_log_fname();
+     if (! -e $log) {
+       print "**FAIL** (No compile-time log files)";
+       print "\n";
+       return 1;
+     }
+
+     @errs = &get_compiletime_errors($testdir);
+
+#     if ($#errs == -1) {
+#       print "**FAIL** (No compile-time log file)\n";
+#       return 1;
+#     }
+
+     foreach $err (@errs) {
+       $err =~ m/^(.*)#(\d+)$/;
+       if (&check_comptime_error($testdir, $1, $2)) {
+         print "**FAIL** (Compile-time error)";
+         print "\n";
+         return 1;
+       }
+     }
+
+     if((!-e $log)) {
+       print "pass (with syntax error(s))";
+       print "\n";
+       return 0;
+     }
+     if(scalar(@errs)  > 0) {
+       print "pass (with compile error(s))";
+       print "\n";
+       return 0;
+     }
+   }
+
+   # If the file "post_test.pl" exists, run it to determine success
+   # or failure. Required when the testcase produces some external
+   # output whose presence and format is part of the test's success
+   if (-e "$testdir/post_test.pl") {
+      $post_test = 0;
+      $failed = do "$testdir/post_test.pl";
+      if (!defined($failed) || $@) {
+         print "**FAIL** (Invalid post_test.pl)";
+         print "\n";
+         return 1;
+      }
+      if ($failed ne "0") {
+        $post_test = "post_test: $failed" unless $post_test;
+        print "**FAIL** ($post_test)";
+        print "\n";
+      } else {
+        $post_test = "from post_test.pl" unless $post_test;
+        print "pass ($post_test)";
+        print "\n";
+      }
+      return $failed;
+   }
+
+   if (!open(LOG, "<$log")) {
+     print "**FAIL** (cannot read $log)";
+     print "\n";;
+     return 1;
+   }
+
+   my ($fail, @status_array, $pass_token, $fail_token, $expect_summary, $complete_summary, $unexpected_error);
+   $fail = 0;
+   @status_info = ();
+   $pass_token = 0;
+   $fail_token = 0;
+   $expect_summary = 1;
+   $complete_summary = 0;
+   $unexpected_error = 0;
+
+   $exp_errs = 0; # No errors expected by default
+   $exp_fatals = 0; # No fatals expected by default
+   $in_summary = 0;
+   undef($n_errs);
+   undef($n_fatals);
+   while ($_ = <LOG>) {
+     if (m/UVM TEST FAILED/) {
+       $fail_token = 1;
+       next;
+     }
+     if (m/UVM TEST PASSED/) {
+       $pass_token = 1;
+       next;
+     }
+     if (m/UVM TEST EXPECT (\d+) UVM_ERROR/) {
+       $exp_errs = $1;
+       next;
+     }
+     if (m/UVM TEST EXPECT (\d+) UVM_FATAL/) {
+       $exp_fatals = $1;
+       next;
+     }
+     if (m/UVM TEST EXPECT NO SUMMARY/) {
+       $expect_summary = 0;
+       next;
+     }
+     if (m/UVM Report Summary/) {
+       $in_summary = 1;
+       next;
+     }
+     if ($in_summary && m/^(\# )?UVM_ERROR :\s+(\d+)\s*$/) {
+       $n_errs = $2;
+       next;
+     }
+     if ($in_summary && m/^(\# )?UVM_FATAL :\s+(\d+)\s*$/) {
+       $n_fatals = $2;
+       next;
+     }
+   }
+   close(LOG);
+
+   # Explicit failure
+   if ($fail_token) {
+     $fail = 1;
+     push(@status_array, "explicit FAIL");
+   }
+
+   if ($expect_summary) {
+     if (!$in_summary) {
+       $fail = 1;
+       push(@status_array, "missing summary");
+     } else {
+       if (!defined($n_errs)) {
+         $fail = 1;
+         push(@status_array, "missing UVM_ERROR summary");
+       }
+       if (!defined($n_fatals)) {
+         $fail = 1;
+         push(@status_array, "missing UVM_FATAL summary");
+       }
+     }
+   } else {
+     if ($in_summary) {
+       $fail = 1;
+       push(@status_array, "unexpected summary");
+     }
+   }
+
+   if (defined($n_errs)) {
+     if ($n_errs != $exp_errs) {
+       $fail = 1;
+       if ($exp_errs > 0) {
+         push(@status_array, "$n_errs vs $exp_errs UVM_ERRORs");
+       } else {
+         push(@status_array, "UVM_ERRORs");
+       }
+     } else {
+       if ($exp_errs > 0) {
+         push(@status_array, "with $exp_errs expected UVM_ERRORs");
+       }
+     }
+   }
+
+   if (defined($n_fatals)) {
+     if ($n_fatals != $exp_fatals) {
+       $fail = 1;
+       if ($exp_fatals > 0) {
+         push(@status_array, "$n_fatals vs $exp_fatals UVM_FATALs");
+       } else {
+         push(@status_array, "UVM_FATALs");
+       }
+     } else {
+       if ($exp_fatals > 0) {
+         push(@status_array, "with $exp_fatals expected UVM_FATALs");
+       }
+     }
+   }
+
+   # Maybe the run-time errors were expected...
+   @errs = &get_runtime_errors($testdir);
+   foreach $err (@errs) {
+     local(@s)=split('#',$err);
+     if (&check_runtime_error($testdir, $s[0], $s[1])) {
+       $unexpected_error = 1;
+     }
+   }
+
+   if ($unexpected_error) {
+     $fail = 1;
+     push(@status_array, "runtime error");
+   } else {
+     if (scalar(@errs)) {
+       push(@status_array, "with expected runtime error(s)");
+     }
+   }
+
+   if (!$pass_token) {
+     $fail = 1;
+     push(@status_array, "missing PASS token");
+   }
+
+   if ($fail) {
+     print "**FAIL**";
+   } else {
+     print "pass";
+   }
+
+   if (scalar(@status_array)) {
+     print " (" . join(", ", @status_array) . ")";
+   }
+   print "\n";
+
+   return $fail;
+
+}
+
+
+#
+# Check that a compile-time error was expected on the
+# specified line in the specified file
+#
+# returns non-zero if the error was NOT expected
+#
+sub check_comptime_error {
+  local($testdir, $fname, $line, $_) = @_;
+
+  $fname = "$testdir/$fname";
+  if (!open(SV, "< $fname")) {
+     return 1;
+  }
+
+  $_ = "";
+  while ($line > 0) {
+    $_ = <SV>;
+    $line--;
+  }
+
+  # OK if magic comment found on line in question
+  return 0 if m/UVM TEST COMPILE-TIME FAILURE/;
+
+  close(SV);
+
+  return 1;
+}
+
+
+#
+# Check that a run-time error was expected on the
+# specified line in the specified file
+#
+# returns non-zero if the error was NOT expected
+#
+sub check_runtime_error {
+  local($testdir, $fname, $line, $_) = @_;
+
+  $fname = "$testdir/$fname";
+  if (!open(SV, "< $fname")) {
+     return 1;
+  }
+
+  $_ = "";
+  while ($line > 0) {
+    $_ = <SV>;
+    $line--;
+  }
+
+  # OK if magic comment found on line in question
+  return 0 if m/UVM TEST RUN-TIME FAILURE/;
+
+  close(SV);
+
+  return 1;
+}
+
+sub maketool {
+    local($make)=which("gmake");
+    if($make eq "") {
+        $make="make";
+    }
+    $make;
+}
+
+sub which {
+my $name = shift;
+
+grep { -e } map { my $file = $_;
+map { catfile $_, $file } path
+} map { $name . lc $_ } (q{}, split /;/);
+}
+
+#
+# Execute a Makefile-based example
+#
+sub make_example {
+  local($dir, $opts, $result, $_) = @_;
+  local($make) = maketool();
+  local($LOCK_FH) = undef;
+  local($comp_args) = $opt_C;
+  return 0 if ($tool eq "clean");
+  
+  $result = 0;
+  $cmd_redirect = q{};
+  if (!$opt_v) {
+    $cmd_redirect = " > /dev/null 2>&1"; # redirect stdout and stderr to dev/null and not verbose
+  }
+  elsif ($opt_l) {
+    $cmd_redirect = " 2>&1"; # if verbose and loggin, redirect stderr to stdout so that it will be in log file
+  }
+  $dir = abs_path($dir);
+  local($rundir) = $dir;
+  if (!$opt_c) {
+    # run test in temp directory.  Directory needs to be 'sibling' of directory passed
+    # in to ensure relative file paths in the makefiles are resolved
+    if ($opt_t) {
+      $rundir = &setup_tempdir($rundir)
+    }
+    elsif ($opt_L) {
+       # user md5 to create unique, reproducable, shorter and legal lock file name
+       # based off the directory the test will run in.
+       $lockfile = $opt_L . "/" . md5_hex($rundir);
+       open($LOCK_FH, ">$lockfile") or die "$lockfile: $!";
+       flock($LOCK_FH, LOCK_EX) or die "flock() failed to lock $lockfile: $!";
+    }
+
+    $cmd = "cd $rundir && $make -f Makefile.$tool $opts $opt_M OPT_C=\"$comp_args\" OPT_R=\"$opt_R\" DEV_TESTS_BASE=\"$dev_tests_base\" UVM_HOME=\"$uvm_home\" all";
+    $cmd .= $cmd_redirect;
+    $result = system($cmd);
+
+  }
+  if (!$opt_d || $opt_c) {
+    $cmd = "cd $rundir && $make -f Makefile.$tool $opts clean DEV_TESTS_BASE=\"$dev_tests_base\" UVM_HOME=\"$uvm_home\"";
+    $cmd .= $cmd_redirect;
+    system($cmd);
+
+    if ($opt_c)
+    {
+      &clean_tempdirs($dir);
+      return 0;
+    }
+  }
+
+  if ($opt_t) {
+     if ($opt_d | (!$opt_nokeep_fails & ($result != 0))) {
+      &relocate_tempdir($rundir,$dir);
+    }
+  }
+
+  # release the lock if one was created.
+  if ($LOCK_FH) {
+    flock($LOCK_FH, LOCK_UN) or die "flock() failed to unlock $lockfile: $!";
+    close($LOCK_FH);
+  }
+
+  return $result;
+}
+
+sub setup_tempdir {
+   local($rundir, $_) = @_;
+   local($tempdir);
+   $rundir = abs_path($rundir);
+   $tempdir = tempdir( TEMPLATE => 'temp_' . $tool . '_' . basename($testdir) . '_XXXX',
+                       DIR      => dirname($rundir),
+                       CLEANUP  => !$opt_d);
+   foreach $file (<$rundir/*>) {
+     symlink($file,$tempdir . '/' . basename($file));
+   }
+   return $tempdir;
+}
+
+sub relocate_tempdir {
+   local($rundir, $dest_dir, $_) = @_;
+    # if not cleaning up tool-generated files
+    # and a temp dir was created, relocate it under the directory passed in
+    # before relocating, if there is already a directory with the same name
+    # then remove it before relocate the temp directory
+    $dest_dir = $dest_dir . '/' . basename($rundir);
+    if( -e $dest_dir) {
+      rmtree($dest_dir);
+    }
+    move($rundir,$dest_dir);
+}
+
+sub clean_tempdirs {
+   local($cleandir, $_) = @_;
+   # find all tool specific temp dirs and remove them.
+   $cleandir = $cleandir . '/temp_' . $tool . '_' . basename($testdir);
+   foreach $cleandir (<$cleandir*>) {
+     rmtree($cleandir);
+   }
+}
+
+#
+# Generates commands to run and what logs will
+# produced when the comands are executed
+#
+# returns a hash with two entires :
+#    'commands' : array of commands to run each test individually
+#    'logs'     : array of log files that will be created by
+#                 running each command in the commands array.
+sub get_job_info {
+  local($dirs_ref, $job_dir) = @_;
+
+  #remove all arguments after the tool argument
+  while($myargv[$#myargv] ne $tool)
+  {
+     pop @myargv;
+  }
+
+  # to avoid duplicate arguments when submitting a job
+  # to the queue use getopts to remove the arguements that
+  # are always passed to queued jobs as well as arguments
+  # the are only intended to be used to submit jobs to the queue
+  Getopt::Long::Configure('pass_through');
+  my %h = ();
+  *ARGV = \@myargv;
+  GetOptions(\%h,
+             "f=s",
+             "F=s",
+             "Ff=s",
+             "Fs=s",
+             "q"  ,
+             "Q=s",
+             "l=s",
+             "L=s",
+             "tests_per_job=i");
+  # if argument has a space in it, make sure to put it in
+  # quotes in order to preserve it as one cmdline argument
+  # on recursive calls to run_tests when submitting
+  # the job to the queue.
+  foreach (@myargv) {
+    if (/\s/o ) {
+      $_  = q{"} . $_ . q{"};
+    }
+  }
+  
+
+  # create temp locks directory tell each job where the lock directory is.
+  unless ($opt_t) {
+    unless ($opt_L) {
+      $opt_L = tempdir( TEMPLATE => 'tempLocksXXXX',
+                        DIR      => $job_dir,
+                        CLEANUP  => 1);
+    }
+    $opt_L = abs_path($opt_L);
+    unshift(@myargv,"-L $opt_L");
+  }
+  $cmdline = join(" ",@myargv);
+  $job_index = 0;
+  $job_log_base = $job_dir . '/job.log.';
+  $opt_tests_per_job = 1 unless defined $opt_tests_per_job;
+
+  $num_tests=0;
+  foreach $dir (@{$dirs_ref}) {
+    $job_index++;
+    # trailing '/'s confuse this script
+    $dir =~ s|/$||;
+    $job_log = $job_log_base . $job_index;
+    #use testfile so that subdirectories are not searched
+    $testfile = $job_dir . '/testfile.' . $job_index;
+    push @test_commands,  $script . " -l $job_log -f $testfile -Ff $job_dir/$tool.fails.$job_index -Fs $job_dir/$tool.fails.$job_index $cmdline";
+    if (!open(TESTFILE, "> $testfile")) {
+      print STDERR "Cannot open \"$testfile\" for writing: $!\n";
+      exit(1);
+    }
+    print TESTFILE $dir;
+    close(TESTFILE);
+    $logs{$dir} = $job_log;
+    $num_tests++;
+    if ($num_tests == $opt_tests_per_job) {
+       push @commands, join("\n",@test_commands);
+       $num_tests = 0;
+       @test_commands = ();
+    }
+
+  }
+  if (scalar @test_commands > 0) {
+    push @commands, join("\n",@test_commands); 
+  }
+  $job_info_ref->{'commands'} = \@commands;
+  $job_info_ref->{'logs'} = \%logs;
+  return $job_info_ref;
+}
+
+#
+# Submit the commands to LSF
+#
+sub queue_jobs {
+  local(@commands) = @_;
+  $ENV{'LSB_JOB_REPORT_MAIL'}="N";
+  $job_file_base = $job_dir . '/job.file.';
+  $job_name_base = "run_tests.$$";
+
+
+  $job_index = 0;
+  foreach $cmd (@commands) {
+     $job_index++;
+    $job_file = $job_file_base . $job_index;
+    if (!open(JOBFILE, "> $job_file")) {
+      print STDERR "Cannot open \"$job_file\" for writing: $!\n";
+      exit(1);
+    }
+    print JOBFILE $cmd;
+    close(JOBFILE);
+    chmod S_IRWXU, $job_file;
+  }
+  $opt_Qx = q{bsub} unless defined $opt_Qx;
+  $opt_Q = q{} unless defined $opt_Q;
+  
+  $cmd_redirect = q{};
+  if (!$opt_v) {
+    $cmd_redirect = " > /dev/null 2>&1";
+  }
+  elsif ($opt_l) {
+    $cmd_redirect = " 2>&1";
+  }
+
+  $cmd = $opt_Qx .' '. $opt_Q . ' -J "' . $job_name_base . '[1-' . $job_index . ']" ' . $job_file_base . '\$LSB_JOBINDEX';
+  $cmd .= $cmd_redirect;
+  $cmd .= '; ' . $opt_Qx . ' ' . $opt_Q . ' -K -w "ended(' . $job_name_base . ')" -J "' . $job_name_base . '.ended" date';
+  $cmd .= $cmd_redirect;
+  system($cmd);
+}
+#
+# Parse output logs to determine pass/fail/skip results
+#
+# Display on STDOUT the log output except
+# for the results summary portion of the log
+#
+sub get_job_result {
+  local($dirs_ref, $logs_ref, $skips_out, $fails_out) = @_;
+  foreach $dir (@{$dirs_ref}) {
+     $log = $logs_ref->{$dir};
+    $pass_fail_skip = 'INCOMPLETE';
+    if (open(JOBOUTPUT, "< $log")) {
+      while ($_ = <JOBOUTPUT>) {
+        #  Total of %d tests ............................. PASSED all tests
+        #  Total of %d tests ............................. PASSED %d of %d tests (%d skipped)
+        #  Total of %d tests ............................. FAILED %d of %d tests (%d skipped)
+        if (/Total of \d+ tests \.+ (.*)/) {
+          $pass_fail_skip = $1;
+          $test_failed_or_skipped = 0;
+          pop @output; # remove dashes on line that preceeds pass/fail result
+          if($pass_fail_skip =~ /(PASSED|FAILED) (\d+) of (\d+) tests \((\d+) skipped\)/) {
+            $test_failed_or_skipped = 1;
+            if ($1 eq 'FAILED') {
+              $failures+=$2;
+            }
+            $failures+=$4; #skips increment failures and are later removed from the overall fail count
+            $skipped+=$4;
+            if ($skips_out && ($4 != 0)) {
+                print $skips_out "$dir\n";
+            } else {
+                print $fails_out "$dir\n";
+            }
+          }
+          last;
+        }
+        chomp($_);
+        push(@output, $_);
+      }
+      close(JOBOUTPUT);
+    }
+    if ($pass_fail_skip eq 'INCOMPLETE') {
+      if (length($dir) > 43) {
+        $dir = "*" . substr($dir, length($dir)-43, length($dir));
+      }
+      $dots = substr("............................................", 0, 45-length($dir));
+      push(@output, "$dir $dots INCOMPLETE");
+      $failures++;
+      if ($opt_F) {
+        print Fout "$dir\n";
+      }
+    }
+  }
+  print join("\n",@output) . "\n";
+}
+
+
+# Makes the script a "modulino": http://www.drdobbs.com/scripts-as-modules/184416165
+# i.e. a script which can behave like a module when imported or a module which can behave like a script when executed
+__PACKAGE__->run() unless caller;
